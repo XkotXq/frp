@@ -20,6 +20,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { BrowserMultiFormatReader } from "@zxing/browser";
+import { BarcodeFormat, DecodeHintType } from "@zxing/library";
 
 const STORAGE_KEY = "ystock-v2";
 const OLD_STORAGE_KEY = "frp-records-v1";
@@ -109,7 +110,7 @@ function digitsOnly(value) {
 function formatLengthKm(value) {
 	const m = Number(value);
 	if (!Number.isFinite(m) || !value) return value || "-";
-	return `${new Intl.NumberFormat("pl-PL", { maximumFractionDigits: 3 }).format(m / 1000)} km`;
+	return new Intl.NumberFormat("pl-PL", { maximumFractionDigits: 3 }).format(m / 1000);
 }
 
 function formatLengthKmExport(value) {
@@ -576,6 +577,7 @@ export default function Home() {
 	const [torchSupported, setTorchSupported] = useState(false);
 	const scannerVideoRef = useRef(null);
 	const scannerControlsRef = useRef(null);
+	const scannerTrackRef = useRef(null);
 
 	const [frpDbVisible, setFrpDbVisible] = useState(false);
 	const [frpDbSheetVisible, setFrpDbSheetVisible] = useState(false);
@@ -647,6 +649,32 @@ export default function Home() {
 		window.addEventListener("popstate", onPopState);
 		return () => window.removeEventListener("popstate", onPopState);
 	}, []);
+
+	useEffect(() => {
+		if (!activeMaterial || !("wakeLock" in navigator)) return;
+		let wakeLock = null;
+		let cancelled = false;
+		async function requestWakeLock() {
+			try {
+				wakeLock = await navigator.wakeLock.request("screen");
+			} catch {
+				wakeLock = null;
+			}
+		}
+		function onVisibilityChange() {
+			if (!cancelled && document.visibilityState === "visible" && !wakeLock) {
+				requestWakeLock();
+			}
+		}
+		requestWakeLock();
+		document.addEventListener("visibilitychange", onVisibilityChange);
+		return () => {
+			cancelled = true;
+			document.removeEventListener("visibilitychange", onVisibilityChange);
+			wakeLock?.release().catch(() => {});
+			wakeLock = null;
+		};
+	}, [activeMaterial]);
 
 	function openMaterial(key) {
 		window.history.pushState({ material: key }, "");
@@ -1081,17 +1109,21 @@ export default function Home() {
 	function closeScanner() {
 		scannerControlsRef.current?.stop();
 		scannerControlsRef.current = null;
+		scannerTrackRef.current = null;
 		setTorchOn(false);
 		setScannerVisible(false);
 	}
 
 	async function toggleTorch() {
-		if (!scannerControlsRef.current?.switchTorch) return;
+		const track = scannerTrackRef.current;
+		if (!track) return;
+		const next = !torchOn;
 		try {
-			await scannerControlsRef.current.switchTorch(!torchOn);
-			setTorchOn((prev) => !prev);
+			await track.applyConstraints({ advanced: [{ torch: next }] });
+			setTorchOn(next);
 		} catch {
 			setTorchSupported(false);
+			showToast("Latarka niedostępna na tym urządzeniu.", "error");
 		}
 	}
 
@@ -1112,14 +1144,28 @@ export default function Home() {
 	useEffect(() => {
 		if (!scannerVisible) return;
 		let cancelled = false;
-		const codeReader = new BrowserMultiFormatReader();
+		scannerTrackRef.current = null;
+		const hints = new Map();
+		hints.set(DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.QR_CODE]);
+		hints.set(DecodeHintType.TRY_HARDER, true);
+		const codeReader = new BrowserMultiFormatReader(hints, { delayBetweenScanAttempts: 100, delayBetweenScanSuccess: 300 });
+		const constraints = {
+			video: {
+				facingMode: "environment",
+				width: { ideal: 1920 },
+				height: { ideal: 1080 },
+				advanced: [{ focusMode: "continuous" }],
+			},
+		};
 		codeReader
-			.decodeFromVideoDevice(undefined, scannerVideoRef.current, (result, _err, controls) => {
+			.decodeFromConstraints(constraints, scannerVideoRef.current, (result, _err, controls) => {
 				scannerControlsRef.current = controls;
-				if (!cancelled) {
+				if (!cancelled && !scannerTrackRef.current) {
 					const track = scannerVideoRef.current?.srcObject?.getVideoTracks?.()[0];
-					const caps = track?.getCapabilities?.();
-					setTorchSupported(Boolean(controls?.switchTorch && caps?.torch));
+					if (track) {
+						scannerTrackRef.current = track;
+						setTorchSupported(true);
+					}
 				}
 				if (result) handleScanResult(result.getText());
 			})
@@ -1130,6 +1176,7 @@ export default function Home() {
 			cancelled = true;
 			scannerControlsRef.current?.stop();
 			scannerControlsRef.current = null;
+			scannerTrackRef.current = null;
 		};
 	}, [scannerVisible]);
 
@@ -1570,7 +1617,7 @@ export default function Home() {
 				<tr>
 					<th onClick={() => setItemIdDisplayMode((c) => (c === "full" ? "short" : "full"))} className={`${thCls} cursor-pointer select-none hover:bg-blue-800 ${itemIdDisplayMode === "short" ? "w-16" : "min-w-[9rem]"}`}>item</th>
 					<th className={thCls}>średnica</th>
-					<th className={thCls}>długość</th>
+					<th className={thCls}>długość (km)</th>
 					<th className={thCls}>XB/Z</th>
 					<th className={thCls}>nr szpuli</th>
 					<th className={thCls}>lokalizacja</th>
@@ -1583,7 +1630,7 @@ export default function Home() {
 			return (
 				<tr>
 					<th className={thCls}>średnica</th>
-					<th className={thCls}>długość</th>
+					<th className={thCls}>długość (km)</th>
 					<th className={thCls}>nr szpuli</th>
 					<th className={thCls}>lokalizacja</th>
 					<th className={thCls}>notatka</th>
@@ -1741,7 +1788,14 @@ export default function Home() {
 			{/* header */}
 			<div className="flex items-center justify-between gap-2 border-b border-slate-200 bg-white px-3 py-2 shadow-sm">
 				<button onClick={goToMenu} className="shrink-0 rounded-full bg-slate-100 px-4 py-1.5 text-sm font-semibold text-slate-800 transition hover:bg-slate-200">← Wstecz</button>
-				<span className="min-w-0 flex-1 truncate text-center text-xl font-extrabold text-slate-900" title={matLabel}>{matLabel}</span>
+				<button
+					type="button"
+					onClick={() => activeSelectedId && scrollRowIntoView(activeSelectedId)}
+					className="min-w-0 flex-1 truncate border-0 bg-transparent p-0 text-center text-xl font-extrabold text-slate-900 transition hover:text-blue-700"
+					title={activeSelectedId ? `Przewiń do zaznaczonego wpisu (${matLabel})` : matLabel}
+				>
+					{matLabel}
+				</button>
 				<div className="flex shrink-0 items-center gap-2">
 					{activeMaterial && (
 						<button
@@ -1949,7 +2003,14 @@ export default function Home() {
 												</label>
 											) : (
 												<label className={labelCls}>
-													<span className={labelTextCls}>Lokalizacja</span>
+													<div className="flex items-center justify-between gap-2">
+														<span className={labelTextCls}>Lokalizacja</span>
+														{(sheetMaterial === "frp" || sheetMaterial === "coatedFrp") && lastLocation && lastLocation !== sheetDraft?.location && (
+															<button type="button" onClick={() => updateSheetField("location", lastLocation)} className="rounded-full border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 transition hover:bg-slate-200">
+																Ostatnia: {lastLocation}
+															</button>
+														)}
+													</div>
 													<input value={sheetDraft?.location ?? ""} onChange={(e) => updateSheetField("location", e.target.value)} className={inputCls} placeholder="np. hala A / regał 3" />
 												</label>
 											)}
@@ -2001,7 +2062,14 @@ export default function Home() {
 												</label>
 											</div>
 											<label className={labelCls}>
-												<span className={labelTextCls}>Lokalizacja</span>
+												<div className="flex items-center justify-between gap-2">
+													<span className={labelTextCls}>Lokalizacja</span>
+													{sheetMode === "edit" && lastLocation && lastLocation !== sheetDraft?.location && (
+														<button type="button" onClick={() => updateSheetField("location", lastLocation)} className="rounded-full border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 transition hover:bg-slate-200">
+															Ostatnia: {lastLocation}
+														</button>
+													)}
+												</div>
 												<div className="flex gap-2">
 													<input value={sheetDraft?.location ?? ""} onChange={(e) => updateSheetField("location", e.target.value)} className={`${inputCls} flex-1`} placeholder="np. hala A / regał 3" />
 													<button type="button" onClick={openScanner} aria-label="Skanuj kod kreskowy" title="Skanuj kod kreskowy" className="shrink-0 rounded-md border border-slate-300 bg-white px-2.5 text-slate-700 transition hover:bg-slate-100">
@@ -2041,7 +2109,14 @@ export default function Home() {
 												</label>
 											</div>
 											<label className={labelCls}>
-												<span className={labelTextCls}>Lokalizacja</span>
+												<div className="flex items-center justify-between gap-2">
+													<span className={labelTextCls}>Lokalizacja</span>
+													{sheetMode === "edit" && lastLocation && lastLocation !== sheetDraft?.location && (
+														<button type="button" onClick={() => updateSheetField("location", lastLocation)} className="rounded-full border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 transition hover:bg-slate-200">
+															Ostatnia: {lastLocation}
+														</button>
+													)}
+												</div>
 												<input value={sheetDraft?.location ?? ""} onChange={(e) => updateSheetField("location", e.target.value)} className={inputCls} placeholder="np. hala A / regał 3" />
 											</label>
 											<label className={labelCls}>
